@@ -1,20 +1,32 @@
 {
   "name": "@pipeworx/mcp-openfda",
-  "version": "0.1.0",
-  "description": "OpenFDA MCP — wraps the openFDA API (free, no auth required)",
+  "version": "0.1.1",
+  "description": "FDA drug data via openFDA: adverse-event reports and safety-signal tools (FAERS search, event counts, disproportionality/ROR-PRR summaries, reaction profiles, trends), drug and novel-drug approvals (Drugs@FDA, by-company application history), drug labeling, drug and food recalls, drug shortages and shortage changes, complete response letters, warning letters, and a postmarket risk-profile compound.",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "mcp-openfda": "bin/cli.js"
+  },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "openfda"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipeworx-io/mcp-openfda"
+    "url": "git+https://github.com/pipeworx-io/mcp-openfda.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-5112a41b08966f1d3866c027963cbbb0198b385878635b7fde56f6f85e3b5370",
+    "sourceCommit": "adb69d997f82a62e8e22b594488c7d04a227db35"
   }
 }
