@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-openfda",
-  "version": "0.1.2",
-  "description": "FDA drug data via openFDA: adverse-event reports and safety-signal tools (FAERS search, event counts, disproportionality/ROR-PRR summaries, reaction profiles, trends), drug and novel-drug approvals (Drugs@FDA, by-company application history), drug labeling, drug and food recalls, drug shortages and shortage changes, complete response letters, warning letters, and a postmarket risk-profile compound.",
+  "version": "0.1.3",
+  "description": "FDA drug data via openFDA: adverse-event reports and safety-signal tools (FAERS search, event counts, disproportionality/ROR-PRR summaries, reaction profiles, trends), drug and novel-drug approvals (Drugs@FDA, by-company application history), drug labeling, drug and food recalls, drug shortages and…",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-99b5abc465ee3f414e70f3ce4510ede9a0447a22ac298fb6388efa7aa6685e2d",
-    "sourceCommit": "97740c6ee04c8acbfe7dddcacfde9e88ff2b9ca0"
+    "sourceHash": "v1-e0b2a3fbdfd5773e2663a14a03b6a39f3c0b96328f2b7268488cc9507b874d45",
+    "sourceCommit": "8dbe088fb6f9d2c88f934173742329b4e20a67d6"
   }
 }
