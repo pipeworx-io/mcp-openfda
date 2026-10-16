@@ -977,7 +977,7 @@ const tools: McpToolExport['tools'] = [
         query: {
           type: 'string',
           description:
-            'OpenFDA search query. Filter drugs on patient.drug.medicinalproduct — the report\'s own drug-name field, present on every record and matching brand or generic. The patient.drug.openfda.* fields are enrichment that is missing for many newer drugs (semaglutide/OZEMPIC among them) and silently match nothing; this tool retries them against medicinalproduct, but naming it directly costs one call instead of two. Examples: \'patient.drug.medicinalproduct:"OZEMPIC"\', \'patient.drug.medicinalproduct:"semaglutide"+AND+serious:1\', \'receivedate:[20240101+TO+20241231]\'',
+            'OpenFDA search query. FAERS stores a drug under FOUR different fields and no single one is complete: patient.drug.openfda.generic_name / .brand_name / .substance_name are enrichment (missing for some newer or compounded drugs, but when present they fold every brand variant under the ingredient), and patient.drug.medicinalproduct is the reporter\'s own free-text drug name (always present, but literal — a generic-name filter there misses every report filed under a brand). A query that names exactly ONE of these four fields for a drug is automatically expanded to an OR across all four with the same value, so you get every report regardless of which field openFDA happened to index it under — the response names which fields were searched in drug_name_fields_searched. Write whichever single field is natural; do not hand-write the OR yourself. Examples: \'patient.drug.medicinalproduct:"OZEMPIC"\', \'patient.drug.openfda.generic_name:"semaglutide"+AND+serious:1\', \'receivedate:[20240101+TO+20241231]\'',
         },
         limit: {
           type: 'number',
@@ -1596,21 +1596,50 @@ function reactionResolutionFields(reaction: ResolvedReaction) {
       };
 }
 
-// The events index's openfda.* enrichment is sparser than the label endpoint's
-// (fdaDrugLabels above has its own ladder for that one) — confirmed live: FAERS
-// reports mentioning semaglutide/OZEMPIC return upstream NOT_FOUND under BOTH
-// patient.drug.openfda.generic_name AND .brand_name (39k+ ibuprofen/Advil-class
-// drugs are fine; newer drugs lag the NDC-matching pipeline that populates this
-// block), while patient.drug.medicinalproduct — the report's own free-text drug
-// field, always present — answers the identical drug immediately. Same silent
-// shape as the reaction-permutation gap below: HTTP 200, well-formed, total: 0,
-// and nothing in the response says the field name was the problem.
-const DRUG_OPENFDA_FIELD_RE = /patient\.drug\.openfda\.(?:generic_name|brand_name|substance_name)(?:\.exact)?:"([^"]+)"/i;
+// FAERS stores a drug name under FOUR fields and none of them is complete on
+// its own, in either direction:
+//   - patient.drug.openfda.{generic_name,brand_name,substance_name} is
+//     enrichment that maps a report to an NDC and then to that NDC's other
+//     names. It is MISSING for some newer/compounded drugs (NOT_FOUND upstream
+//     — the #5f38a3c95 bug, 2026-08), but when present it is the field that
+//     folds every brand variant under one ingredient, or vice versa.
+//   - patient.drug.medicinalproduct is the reporter's own free-text drug name.
+//     Always present, but literal: a generic-name filter there only matches
+//     reports where someone typed the generic name, missing every report
+//     filed under a brand (semaglutide:39 vs the comprehensive 631 for the
+//     same drug+reaction — #3146, 2026-10 — because 5f38a3c95 steered every
+//     query onto this field alone and it undercounts brand-named reports).
+// Neither field is safe as the ONLY one searched, so a query naming exactly
+// one of the four is expanded to an OR across all four with the same value.
+// This production (not a two-call retry) means a drug missing from openfda.*
+// still answers via medicinalproduct (preserves the Aug fix), AND a drug whose
+// reports are split across brand/generic spellings is counted in full (fixes
+// #3146) — in one upstream call either way.
+const DRUG_NAME_FIELD_RE =
+  /patient\.drug\.(?:openfda\.(?:generic_name|brand_name|substance_name)|medicinalproduct)(?:\.exact)?:"([^"]+)"/gi;
 
-function drugFieldFallbackQuery(query: string): string | null {
-  const m = DRUG_OPENFDA_FIELD_RE.exec(query);
-  if (!m) return null;
-  return `${query.slice(0, m.index)}patient.drug.medicinalproduct:"${m[1]}"${query.slice(m.index + m[0].length)}`;
+const DRUG_NAME_OR_FIELDS = [
+  'patient.drug.openfda.brand_name',
+  'patient.drug.openfda.generic_name',
+  'patient.drug.openfda.substance_name',
+  'patient.drug.medicinalproduct',
+] as const;
+
+/**
+ * If `query` names exactly one of the four drug-name fields for a single
+ * value, replace that one filter with an OR across all four (same value).
+ * Returns null when there is no such filter, or more than one (an
+ * already-compound query — e.g. a brand vs. generic comparison — is left
+ * alone rather than risk changing what it means).
+ */
+function expandDrugNameQuery(query: string): { expanded: string; value: string } | null {
+  const matches = [...query.matchAll(DRUG_NAME_FIELD_RE)];
+  if (matches.length !== 1) return null;
+  const m = matches[0];
+  const value = m[1];
+  const orClause = `(${DRUG_NAME_OR_FIELDS.map((f) => `${f}:"${value}"`).join('+OR+')})`;
+  const expanded = `${query.slice(0, m.index)}${orClause}${query.slice((m.index ?? 0) + m[0].length)}`;
+  return { expanded, value };
 }
 
 async function fdaDrugEvents(query: string, limit?: number, skip?: number, apiKey?: string) {
@@ -1618,23 +1647,11 @@ async function fdaDrugEvents(query: string, limit?: number, skip?: number, apiKe
   const s = Math.max(0, skip ?? 0);
   const run = async (q: string) => fdaFetch('/drug/event.json', `search=${encodeQuery(q)}&limit=${l}&skip=${s}`, apiKey);
 
-  let workingQuery = query;
+  const drugExpansion = expandDrugNameQuery(query);
+  let workingQuery = drugExpansion ? drugExpansion.expanded : query;
   let finalData = await run(workingQuery);
-  let drugFieldFrom: string | null = null;
   let reactionNormalizedFrom: string | null = null;
   let reactionNormalizedTo: string | null = null;
-
-  if ((finalData.meta?.results?.total ?? 0) === 0) {
-    const altQuery = drugFieldFallbackQuery(workingQuery);
-    if (altQuery) {
-      const altData = await run(altQuery);
-      if ((altData.meta?.results?.total ?? 0) > 0) {
-        drugFieldFrom = DRUG_OPENFDA_FIELD_RE.exec(workingQuery)![0];
-        workingQuery = altQuery;
-        finalData = altData;
-      }
-    }
-  }
 
   if ((finalData.meta?.results?.total ?? 0) === 0) {
     const m = REACTION_EXACT_RE.exec(workingQuery);
@@ -1658,10 +1675,11 @@ async function fdaDrugEvents(query: string, limit?: number, skip?: number, apiKe
     skip: finalData.meta?.results?.skip ?? 0,
     limit: finalData.meta?.results?.limit ?? l,
     results: (finalData.results ?? []).map(projectFaersRecord),
-    ...(drugFieldFrom
+    ...(drugExpansion
       ? {
-          drug_field_resolution: 'fallback_to_medicinalproduct' as const,
-          drug_field_resolution_note: `No FAERS report is indexed under ${drugFieldFrom.split(':')[0]} for this drug — matched via patient.drug.medicinalproduct instead (the report's own free-text drug name field, always present even when openFDA's brand/generic-name enrichment is missing).`,
+          drug_name_fields_searched: DRUG_NAME_OR_FIELDS,
+          drug_field_resolution: 'expanded_to_all_name_fields' as const,
+          drug_field_resolution_note: `The query named a single drug-name field for "${drugExpansion.value}" — expanded to an OR across all four FAERS drug-name fields (openfda.brand_name / generic_name / substance_name, plus the reporter's free-text medicinalproduct) so the count does not miss reports filed under a brand, a generic, or a drug openFDA's NDC enrichment hasn't matched yet.`,
         }
       : {}),
     ...(reactionNormalizedFrom
