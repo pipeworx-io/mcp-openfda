@@ -1041,7 +1041,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'fda_novel_approvals',
     description:
-      'Most recent novel drug approvals — the newest drugs approved by the FDA. Use for "what is the most recent novel drug the FDA approved", "latest FDA drug approvals", "recently approved new drugs or biologics this month/year". Returns original NDA/BLA approvals (generics excluded by default) sorted newest-first, with approval date, brand name, active ingredients, sponsor, and application number. Not for label text (fda_drug_labels) or searching a specific known drug (fda_drug_approvals).',
+      'Most recent NOVEL drug approvals, in FDA/CDER\'s own sense of the word: a new drug or biologic never before approved or marketed in the U.S. (read live from FDA\'s own published Novel Drug Approvals list). Use for "what is the most recent novel drug the FDA approved", "how many novel drugs has CDER approved this year", "latest FDA drug approvals". Excludes generics, reformulations of an already-approved ingredient, and biosimilars — these are NOT on FDA\'s novel list even though they are "original" NDA/BLA submissions. Returns approval date, drug name, active ingredient, and approved use, sorted newest-first; application numbers/sponsors are not published on FDA\'s novel-drug page. Pass include_generics:true for a different, broader count (every original NDA/BLA/ANDA approval reconstructed from Drugs@FDA, reformulations/biosimilars included) — that path says so in its own note. Not for label text (fda_drug_labels) or searching a specific known drug (fda_drug_approvals).',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1055,7 +1055,8 @@ const tools: McpToolExport['tools'] = [
         },
         include_generics: {
           type: 'boolean',
-          description: 'Also include original ANDA (generic) approvals (default false — novel means NDA/BLA only)',
+          description:
+            'When true, switch from FDA\'s own novel-drug list to a broader Drugs@FDA reconstruction that also includes original ANDA (generic) approvals, reformulations, and biosimilars (default false — the default is FDA\'s own "novel" list, which excludes all of those).',
         },
         skip: {
           type: 'number',
@@ -2004,22 +2005,158 @@ async function fdaApplicationsByCik(cikOrTicker: string | undefined, limitArg: n
   };
 }
 
+// ── CDER's own "novel drug approvals" list (fleet #3165) ────────────────
+//
+// fda_novel_approvals used to answer "novel" by reconstructing it from
+// Drugs@FDA (openFDA drugsfda.json): ORIG+AP submissions in the window,
+// kept only if the application number starts NDA/BLA. That is NOT what FDA
+// means by "novel" — verified live 2026-10-16 against FDA's own published
+// page (fda.gov/drugs/novel-drug-approvals-fda/novel-drug-approvals-2026,
+// which defines "novel" as "new drugs never before approved or marketed in
+// the U.S."): the reconstruction both OVER-counts (an NDA/BLA that is a new
+// salt form, a biosimilar, or a reformulation of an already-approved
+// ingredient is an "original" submission but is not on FDA's novel list —
+// ZUEINO/diclofenac and the ZIMRIXBY rituximab biosimilar both appeared in
+// our reconstruction, neither is one of FDA's 46 for 2026) and UNDER-counts
+// current-year totals, because openFDA's drugsfda bulk index lags the
+// published page by days to weeks (our days=365 reconstruction topped out
+// at EMCITATE/2026-09-28; FDA's page already listed HOVILPRI/2026-10-09).
+// Net effect measured live: a days=289 (~2026 YTD) call returned total 38
+// against FDA's published 46 for the same period — a silent, wrong,
+// non-empty answer, not an error.
+//
+// It was also SLOW for the same structural reason: Drugs@FDA has no
+// "novel" filter, so matching it required paging through every ORIG+AP
+// record in the window (~700 of them for a year) at 100/page, sequentially
+// awaited. Measured live: 10 sequential upstream calls, 3,383ms upstream —
+// over budget for a 3s router leg on its own, before any router timeout is
+// touched (coordinate with #3172; this fix does not change that budget).
+//
+// Fix: for the default "novel" question (include_generics false, FDA's own
+// sense of the word), read FDA's own per-year published table directly —
+// it is a plain server-rendered HTML table, one GET per calendar year the
+// window touches (at most 2, fetched in parallel), no pagination needed.
+// This is both the authoritative count AND far fewer round trips. The
+// include_generics:true path (a different, broader question FDA does not
+// call "novel") keeps the Drugs@FDA reconstruction, with its own pages now
+// fetched in parallel instead of sequentially — same speed fix, honest
+// about the different definition in its own note.
+const FDA_NOVEL_PAGE_URL = (year: number) => `https://www.fda.gov/drugs/novel-drug-approvals-fda/novel-drug-approvals-${year}`;
+
+// One row: <tr><td>46.</td><td>Hovilpri</td><td>pritelivir</td><td>10/9/2026</td><td>...use text...</td></tr>
+const FDA_NOVEL_ROW_RE =
+  /<tr>\s*<td>\s*(\d+)\.\s*<\/td>\s*<td>([\s\S]*?)<\/td>\s*<td>([\s\S]*?)<\/td>\s*<td>([\s\S]*?)<\/td>\s*<td>([\s\S]*?)<\/td>\s*<\/tr>/gi;
+
+function stripNovelHtml(s: string): string {
+  return s
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&#8217;|&rsquo;/g, '’')
+    .replace(/&#8216;|&lsquo;/g, '‘')
+    .replace(/&quot;/g, '"')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+type NovelRow = {
+  approval_date: string; // YYYY-MM-DD
+  rank_in_year: number;
+  year: number;
+  drug_name: string;
+  active_ingredients: string[];
+  use: string;
+};
+
+/** One year's page. null means the fetch failed or the page had no parseable rows — caller must treat that year as NOT covered, never as zero approvals. */
+async function fetchCderNovelYear(year: number): Promise<NovelRow[] | null> {
+  let res: Response;
+  try {
+    res = await pwFetch(FDA_NOVEL_PAGE_URL(year), {
+      headers: { 'User-Agent': 'pipeworx-mcp-openfda/1.0 (+https://pipeworx.io)', Accept: 'text/html' },
+    });
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  const html = await res.text();
+  const rows: NovelRow[] = [];
+  for (const m of html.matchAll(FDA_NOVEL_ROW_RE)) {
+    const name = stripNovelHtml(m[2]);
+    const ingredient = stripNovelHtml(m[3]);
+    const dateRaw = stripNovelHtml(m[4]);
+    const use = stripNovelHtml(m[5]);
+    const dm = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(dateRaw);
+    if (!dm || !name) continue;
+    rows.push({
+      approval_date: `${dm[3]}-${dm[1].padStart(2, '0')}-${dm[2].padStart(2, '0')}`,
+      rank_in_year: Number(m[1]),
+      year,
+      drug_name: name,
+      active_ingredients: ingredient ? [ingredient] : [],
+      use,
+    });
+  }
+  // A page that loaded but whose table didn't match the expected shape (FDA
+  // changed markup, or served a block/challenge page instead) is exactly the
+  // silent-empty case this whole fix exists to avoid — treat zero parsed rows
+  // the same as a fetch failure, never as "FDA approved nothing that year".
+  return rows.length ? rows : null;
+}
+
+async function fdaNovelApprovalsFromCder(days: number, resultSkip: number, limit: number) {
+  const now = new Date();
+  const start = new Date(now.getTime() - days * 86400_000);
+  const startS = start.toISOString().slice(0, 10);
+  const endS = now.toISOString().slice(0, 10);
+  const years = [...new Set([start.getUTCFullYear(), now.getUTCFullYear()])];
+
+  const fetched = await Promise.all(years.map((y) => fetchCderNovelYear(y)));
+  const failedYears = years.filter((_, i) => fetched[i] === null);
+  const rows = fetched.flatMap((r) => r ?? []).filter((r) => r.approval_date >= startS && r.approval_date <= endS);
+  rows.sort((a, b) => (a.approval_date < b.approval_date ? 1 : -1));
+  const windowed = rows.slice(resultSkip, resultSkip + limit);
+  const coverage: 'complete' | 'partial' = failedYears.length ? 'partial' : 'complete';
+
+  return {
+    window_days: days,
+    from: startS,
+    to: endS,
+    skip: resultSkip,
+    count: windowed.length,
+    total_in_window: rows.length,
+    coverage,
+    ...(coverage === 'partial'
+      ? {
+          coverage_note: `Could not load FDA's published novel-drug-approvals page for ${failedYears.join(' and ')} — total_in_window (${rows.length}) is a LOWER BOUND for this window, not the true count. Retry, or narrow "days" to a window inside a year that did load.`,
+        }
+      : {}),
+    source: 'FDA/CDER Novel Drug Approvals (official per-year published list)',
+    note:
+      'FDA\'s own definition of "novel": a new drug or biologic never before approved or marketed in the U.S. This excludes generics, reformulations of an already-approved ingredient, and biosimilars — a broader, different count from Drugs@FDA\'s "original NDA/BLA/ANDA approvals". Pass include_generics:true for that broader Drugs@FDA reconstruction instead; FDA does not call it "novel". Application numbers and sponsors are not published on this page — look up a specific drug with fda_drug_approvals if you need them.',
+    approvals: windowed,
+  };
+}
+
 /**
- * Newest original NDA/BLA approvals in a rolling window. Two things make this
- * non-trivial on the drugsfda endpoint (verified live 2026-07-21):
+ * Newest original NDA/BLA/ANDA approvals in a rolling window, reconstructed
+ * from Drugs@FDA — used only for include_generics:true, a broader question
+ * than FDA's own "novel" list (see fdaNovelApprovalsFromCder above, which
+ * handles the default case). Two things make the reconstruction non-trivial
+ * on the drugsfda endpoint (verified live 2026-07-21):
  * - `sort=submissions.submission_status_date:desc` is unusable: the sort reads
  *   ANY submission in the record's array, so a 1968 drug with a recent
- *   supplement outranks last week's novel approval.
+ *   supplement outranks last week's approval.
  * - The search conditions each match ANY submission independently, so results
  *   must be re-filtered client-side to the SAME submission being ORIG + AP +
- *   in-window (~700 records match the window; ~12 are real NDA/BLA originals).
+ *   in-window.
+ * Pages are fetched with the first page sequential (to learn `total`) and
+ * every remaining page in PARALLEL — the fleet #3165 speed fix: up to ~10
+ * sequential round trips at 100/page was measured at 3.4s upstream alone,
+ * over a 3s router leg budget on its own.
  */
-async function fdaNovelApprovals(args: Record<string, unknown>) {
+async function fdaNovelApprovalsFromDrugsfda(args: Record<string, unknown>, days: number, resultSkip: number, limit: number) {
   const apiKey = apiKeyOf(args);
-  const days = Math.min(365, Math.max(1, Number(args.days) || 90));
-  const limit = Math.min(50, Math.max(1, Number(args.limit) || 10));
-  const resultSkip = Math.max(0, Number(args.skip) || 0);
-  const includeGenerics = args.include_generics === true;
   const now = new Date();
   const fmt = (d: Date) => d.toISOString().slice(0, 10).replace(/-/g, '');
   const startS = fmt(new Date(now.getTime() - days * 86400_000));
@@ -2041,15 +2178,21 @@ async function fdaNovelApprovals(args: Record<string, unknown>) {
     active_ingredients: string[];
     sponsor: string | null;
   }[] = [];
-  let skip = 0;
-  let total = Number.POSITIVE_INFINITY;
-  while (skip < total && skip < 1000) {
-    const data = await fdaFetch('/drug/drugsfda.json', `search=${search}&limit=100&skip=${skip}`, apiKey);
-    total = data.meta?.results?.total ?? 0;
+
+  const CAP = 1000; // 10 pages of 100
+  const first = await fdaFetch('/drug/drugsfda.json', `search=${search}&limit=100&skip=0`, apiKey);
+  const total = first.meta?.results?.total ?? 0;
+  const pages = [first];
+  const remainingSkips: number[] = [];
+  for (let skip = 100; skip < total && skip < CAP; skip += 100) remainingSkips.push(skip);
+  if (remainingSkips.length) {
+    pages.push(...(await Promise.all(remainingSkips.map((skip) => fdaFetch('/drug/drugsfda.json', `search=${search}&limit=100&skip=${skip}`, apiKey)))));
+  }
+
+  for (const data of pages) {
     for (const raw of (data.results ?? []) as DrugsFdaRec[]) {
       const appNo = raw.application_number ?? '';
       const appType = appNo.startsWith('NDA') ? 'NDA' : appNo.startsWith('BLA') ? 'BLA' : appNo.startsWith('ANDA') ? 'ANDA' : 'other';
-      if (!includeGenerics && appType !== 'NDA' && appType !== 'BLA') continue;
       const origDates = (raw.submissions ?? [])
         .filter((s) => s.submission_type === 'ORIG' && s.submission_status === 'AP')
         .map((s) => s.submission_status_date ?? '')
@@ -2066,10 +2209,10 @@ async function fdaNovelApprovals(args: Record<string, unknown>) {
         sponsor: raw.sponsor_name ?? null,
       });
     }
-    skip += 100;
   }
   rows.sort((a, b) => (a.approval_date < b.approval_date ? 1 : -1));
   const windowed = rows.slice(resultSkip, resultSkip + limit);
+  const truncated = total > CAP;
   return {
     window_days: days,
     from: `${startS.slice(0, 4)}-${startS.slice(4, 6)}-${startS.slice(6, 8)}`,
@@ -2077,11 +2220,25 @@ async function fdaNovelApprovals(args: Record<string, unknown>) {
     skip: resultSkip,
     count: windowed.length,
     total_in_window: rows.length,
-    note: includeGenerics
-      ? 'Original approvals including ANDA generics, newest first.'
-      : 'Original NDA/BLA approvals only (novel drugs/biologics; generics excluded), newest first. Source: FDA Drugs@FDA via openFDA.',
+    coverage: truncated ? ('partial' as const) : ('complete' as const),
+    ...(truncated
+      ? {
+          coverage_note: `The window matched more than ${CAP} ORIG+AP submissions before type filtering; only the first ${CAP} (newest-indexed) were scanned, so total_in_window (${rows.length}) is a LOWER BOUND, not the true count. Narrow "days" to see the rest.`,
+        }
+      : {}),
+    note: 'Original NDA/BLA/ANDA approvals reconstructed from Drugs@FDA, newest first — includes reformulations and biosimilars, which FDA\'s own "novel drug" list (the default, include_generics:false) does not count. Source: FDA Drugs@FDA via openFDA.',
     approvals: windowed,
   };
+}
+
+async function fdaNovelApprovals(args: Record<string, unknown>) {
+  const days = Math.min(365, Math.max(1, Number(args.days) || 90));
+  const limit = Math.min(50, Math.max(1, Number(args.limit) || 10));
+  const resultSkip = Math.max(0, Number(args.skip) || 0);
+  const includeGenerics = args.include_generics === true;
+  return includeGenerics
+    ? fdaNovelApprovalsFromDrugsfda(args, days, resultSkip, limit)
+    : fdaNovelApprovalsFromCder(days, resultSkip, limit);
 }
 
 // openFDA indexes a drug under EITHER openfda.brand_name OR openfda.generic_name
