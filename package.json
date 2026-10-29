@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-openfda",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "FDA drug data via openFDA: adverse-event reports and safety-signal tools (FAERS search, event counts, disproportionality/ROR-PRR summaries, reaction profiles, trends), drug and novel-drug approvals (Drugs@FDA, by-company application history), drug labeling, drug and food recalls, drug shortages and…",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-openfda": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "openfda"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-openfda.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/openfda",
   "pipeworx": {
-    "sourceHash": "v1-0546ad1fde760bffe7c7eff812155035ceaf80749ffabc1660a09e8d8e2596c6",
-    "sourceCommit": "f54ad77e789f27fe393978f9c080b5b18c87bb4f"
+    "mode": "gateway",
+    "slug": "openfda",
+    "gatewaySlug": "openfda",
+    "sourceHash": "v1-a7ef31656baaab1aa373c75e462619c572ce371a783ebf70d2ee5b50c5465aa6",
+    "sourceCommit": "b2c4383545bb35171d0ada2beb1c9c7168ea175e"
   }
 }
