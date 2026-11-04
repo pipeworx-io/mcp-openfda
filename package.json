@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-openfda",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "FDA drug data via openFDA: adverse-event reports and safety-signal tools (FAERS search, event counts, disproportionality/ROR-PRR summaries, reaction profiles, trends), drug and novel-drug approvals (Drugs@FDA, by-company application history), drug labeling, drug and food recalls, drug shortages and…",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "openfda",
     "gatewaySlug": "openfda",
-    "sourceHash": "v1-a7ef31656baaab1aa373c75e462619c572ce371a783ebf70d2ee5b50c5465aa6",
-    "sourceCommit": "b2c4383545bb35171d0ada2beb1c9c7168ea175e"
+    "sourceHash": "v1-27e48fd962b1f45a3dba8d3497203981ba8ffd0c3ccc7a50cba7627131b563bd",
+    "sourceCommit": "243a06a6ca2d3b6075325f3b66a1468d0a2eb603"
   }
 }
